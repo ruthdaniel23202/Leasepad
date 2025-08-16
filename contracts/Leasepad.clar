@@ -17,9 +17,19 @@
 (define-constant ERR_DISPUTE_NOT_PENDING (err u115))
 (define-constant ERR_DISPUTE_ALREADY_VOTED (err u116))
 (define-constant ERR_INVALID_VOTE (err u117))
+(define-constant ERR_AMENDMENT_NOT_FOUND (err u118))
+(define-constant ERR_AMENDMENT_ALREADY_EXISTS (err u119))
+(define-constant ERR_AMENDMENT_EXPIRED (err u120))
+(define-constant ERR_AMENDMENT_ALREADY_APPROVED (err u121))
+(define-constant ERR_AMENDMENT_ALREADY_REJECTED (err u122))
+(define-constant ERR_AMENDMENT_NOT_PENDING (err u123))
+(define-constant ERR_INVALID_AMENDMENT_TYPE (err u124))
+(define-constant ERR_INVALID_EFFECTIVE_DATE (err u125))
+(define-constant ERR_AMENDMENT_LIMIT_EXCEEDED (err u126))
 
 (define-data-var lease-counter uint u0)
 (define-data-var dispute-counter uint u0)
+(define-data-var amendment-counter uint u0)
 (define-data-var arbitrator principal CONTRACT_OWNER)
 
 (define-map leases
@@ -94,6 +104,41 @@
     reasoning: (string-ascii 300),
     voted-at: uint
   }
+)
+
+(define-map lease-amendments
+  uint
+  {
+    lease-id: uint,
+    amendment-type: (string-ascii 30),
+    proposer: principal,
+    proposed-changes: (string-ascii 500),
+    new-monthly-rent: (optional uint),
+    new-end-block: (optional uint),
+    new-terms: (optional (string-ascii 300)),
+    effective-date: uint,
+    expiry-date: uint,
+    status: (string-ascii 20),
+    landlord-approved: bool,
+    tenant-approved: bool,
+    proposed-at: uint,
+    approved-at: (optional uint),
+    rejection-reason: (optional (string-ascii 200))
+  }
+)
+
+(define-map amendment-approval-history
+  { amendment-id: uint, approver: principal }
+  {
+    approval-status: (string-ascii 15),
+    approval-date: uint,
+    notes: (string-ascii 300)
+  }
+)
+
+(define-map lease-amendment-count
+  uint
+  uint
 )
 
 
@@ -488,6 +533,244 @@
   )
 )
 
+(define-public (propose-lease-amendment
+  (lease-id uint)
+  (amendment-type (string-ascii 30))
+  (proposed-changes (string-ascii 500))
+  (new-monthly-rent (optional uint))
+  (new-end-block (optional uint))
+  (new-terms (optional (string-ascii 300)))
+  (effective-date uint)
+  (expiry-date uint))
+  (let
+    (
+      (lease (unwrap! (map-get? leases lease-id) ERR_LEASE_NOT_FOUND))
+      (amendment-id (+ (var-get amendment-counter) u1))
+      (current-amendment-count (default-to u0 (map-get? lease-amendment-count lease-id)))
+    )
+    (asserts! (or (is-eq tx-sender (get landlord lease)) 
+                  (is-eq tx-sender (get tenant lease))) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status lease) "active") ERR_LEASE_NOT_ACTIVE)
+    (asserts! (or (is-eq amendment-type "rent-change") 
+                  (is-eq amendment-type "term-extension") 
+                  (is-eq amendment-type "clause-addition") 
+                  (is-eq amendment-type "clause-modification") 
+                  (is-eq amendment-type "security-deposit-change") 
+                  (is-eq amendment-type "early-termination-clause") 
+                  (is-eq amendment-type "maintenance-responsibility") 
+                  (is-eq amendment-type "other")) ERR_INVALID_AMENDMENT_TYPE)
+    (asserts! (> effective-date stacks-block-height) ERR_INVALID_EFFECTIVE_DATE)
+    (asserts! (> expiry-date effective-date) ERR_INVALID_EFFECTIVE_DATE)
+    (asserts! (< current-amendment-count u20) ERR_AMENDMENT_LIMIT_EXCEEDED)
+    
+    (if (is-some new-monthly-rent)
+      (asserts! (> (unwrap-panic new-monthly-rent) u0) ERR_INVALID_AMOUNT)
+      true
+    )
+    
+    (if (is-some new-end-block)
+      (asserts! (> (unwrap-panic new-end-block) (get end-block lease)) ERR_INVALID_EFFECTIVE_DATE)
+      true
+    )
+    
+    (map-set lease-amendments amendment-id
+      {
+        lease-id: lease-id,
+        amendment-type: amendment-type,
+        proposer: tx-sender,
+        proposed-changes: proposed-changes,
+        new-monthly-rent: new-monthly-rent,
+        new-end-block: new-end-block,
+        new-terms: new-terms,
+        effective-date: effective-date,
+        expiry-date: expiry-date,
+        status: "pending",
+        landlord-approved: (is-eq tx-sender (get landlord lease)),
+        tenant-approved: (is-eq tx-sender (get tenant lease)),
+        proposed-at: stacks-block-height,
+        approved-at: none,
+        rejection-reason: none
+      }
+    )
+    
+    (map-set lease-amendment-count lease-id (+ current-amendment-count u1))
+    (var-set amendment-counter amendment-id)
+    (ok amendment-id)
+  )
+)
+
+(define-public (approve-amendment
+  (amendment-id uint)
+  (approval-notes (string-ascii 300)))
+  (let
+    (
+      (amendment (unwrap! (map-get? lease-amendments amendment-id) ERR_AMENDMENT_NOT_FOUND))
+      (lease (unwrap! (map-get? leases (get lease-id amendment)) ERR_LEASE_NOT_FOUND))
+    )
+    (asserts! (or (is-eq tx-sender (get landlord lease)) 
+                  (is-eq tx-sender (get tenant lease))) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status amendment) "pending") ERR_AMENDMENT_NOT_PENDING)
+    (asserts! (< stacks-block-height (get expiry-date amendment)) ERR_AMENDMENT_EXPIRED)
+    
+    (let
+      (
+        (is-landlord (is-eq tx-sender (get landlord lease)))
+        (updated-amendment (if is-landlord
+                            (merge amendment { landlord-approved: true })
+                            (merge amendment { tenant-approved: true })))
+      )
+      (asserts! (if is-landlord
+                  (not (get landlord-approved amendment))
+                  (not (get tenant-approved amendment))) ERR_AMENDMENT_ALREADY_APPROVED)
+      
+      (map-set amendment-approval-history 
+        { amendment-id: amendment-id, approver: tx-sender }
+        {
+          approval-status: "approved",
+          approval-date: stacks-block-height,
+          notes: approval-notes
+        }
+      )
+      
+      (map-set lease-amendments amendment-id updated-amendment)
+      
+      (if (and (get landlord-approved updated-amendment) (get tenant-approved updated-amendment))
+        (begin
+          (try! (execute-amendment amendment-id))
+          (ok true)
+        )
+        (ok true)
+      )
+    )
+  )
+)
+
+(define-public (reject-amendment
+  (amendment-id uint)
+  (rejection-reason (string-ascii 200)))
+  (let
+    (
+      (amendment (unwrap! (map-get? lease-amendments amendment-id) ERR_AMENDMENT_NOT_FOUND))
+      (lease (unwrap! (map-get? leases (get lease-id amendment)) ERR_LEASE_NOT_FOUND))
+    )
+    (asserts! (or (is-eq tx-sender (get landlord lease)) 
+                  (is-eq tx-sender (get tenant lease))) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status amendment) "pending") ERR_AMENDMENT_NOT_PENDING)
+    
+    (map-set amendment-approval-history 
+      { amendment-id: amendment-id, approver: tx-sender }
+      {
+        approval-status: "rejected",
+        approval-date: stacks-block-height,
+        notes: rejection-reason
+      }
+    )
+    
+    (map-set lease-amendments amendment-id 
+      (merge amendment 
+        { 
+          status: "rejected",
+          rejection-reason: (some rejection-reason)
+        }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (execute-amendment (amendment-id uint))
+  (let
+    (
+      (amendment (unwrap! (map-get? lease-amendments amendment-id) ERR_AMENDMENT_NOT_FOUND))
+      (lease (unwrap! (map-get? leases (get lease-id amendment)) ERR_LEASE_NOT_FOUND))
+    )
+    (asserts! (and (get landlord-approved amendment) (get tenant-approved amendment)) ERR_AMENDMENT_NOT_PENDING)
+    (asserts! (is-eq (get status amendment) "pending") ERR_AMENDMENT_NOT_PENDING)
+    (asserts! (>= stacks-block-height (get effective-date amendment)) ERR_INVALID_EFFECTIVE_DATE)
+    
+    (let
+      (
+        (updated-lease (merge lease 
+          {
+            monthly-rent: (default-to (get monthly-rent lease) (get new-monthly-rent amendment)),
+            end-block: (default-to (get end-block lease) (get new-end-block amendment))
+          }
+        ))
+      )
+      (map-set leases (get lease-id amendment) updated-lease)
+      (map-set lease-amendments amendment-id 
+        (merge amendment 
+          { 
+            status: "executed",
+            approved-at: (some stacks-block-height)
+          }
+        )
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (withdraw-amendment (amendment-id uint))
+  (let
+    (
+      (amendment (unwrap! (map-get? lease-amendments amendment-id) ERR_AMENDMENT_NOT_FOUND))
+      (lease (unwrap! (map-get? leases (get lease-id amendment)) ERR_LEASE_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get proposer amendment)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status amendment) "pending") ERR_AMENDMENT_NOT_PENDING)
+    
+    (map-set lease-amendments amendment-id 
+      (merge amendment { status: "withdrawn" })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-amendment (amendment-id uint))
+  (map-get? lease-amendments amendment-id)
+)
+
+(define-read-only (get-amendment-approval (amendment-id uint) (approver principal))
+  (map-get? amendment-approval-history { amendment-id: amendment-id, approver: approver })
+)
+
+(define-read-only (get-amendment-counter)
+  (var-get amendment-counter)
+)
+
+(define-read-only (get-lease-amendment-count (lease-id uint))
+  (default-to u0 (map-get? lease-amendment-count lease-id))
+)
+
+(define-read-only (is-amendment-pending (amendment-id uint))
+  (match (map-get? lease-amendments amendment-id)
+    amendment (is-eq (get status amendment) "pending")
+    false
+  )
+)
+
+(define-read-only (is-amendment-approved (amendment-id uint))
+  (match (map-get? lease-amendments amendment-id)
+    amendment (and (get landlord-approved amendment) (get tenant-approved amendment))
+    false
+  )
+)
+
+(define-read-only (get-amendment-status (amendment-id uint))
+  (match (map-get? lease-amendments amendment-id)
+    amendment (get status amendment)
+    "not-found"
+  )
+)
+
+(define-read-only (is-amendment-expired (amendment-id uint))
+  (match (map-get? lease-amendments amendment-id)
+    amendment (>= stacks-block-height (get expiry-date amendment))
+    false
+  )
+)
+
 (define-read-only (get-dispute (dispute-id uint))
   (map-get? disputes dispute-id)
 )
@@ -527,4 +810,5 @@
     "not-found"
   )
 )
+
 
